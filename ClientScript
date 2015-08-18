@@ -1,0 +1,262 @@
+<?php
+class ClientScript
+{
+	private static $_instance  = null;
+	
+	private $_lsv              = '';
+	private $_lsvCookie        = [];
+	private $_lsUsed           = false;
+	
+	private $_fileMap          = [];
+	private $_fileRepeat       = [];
+	private $_fileRepeatable   = false;
+	private $_fileScript       = [];
+	private $_fileBottom       = false;
+	
+	private $_useMemcached     = true;
+	
+	const MIN_SUFFIX           = '.min';
+	const MIN_FILESIZE         = 100;
+	const LSV_COOKIE_NAME      = 'lsmap';
+	const LS_ERROR_COOKIE_NAME = 'lserr';
+	
+	public static function getInstance()
+	{
+		if (!static::$_instance) {
+			static::$_instance = new static();
+		}
+		return static::$_instance;
+	}
+	
+	private function __construct()
+	{
+		$this->getMemcached();
+		$this->getLsvCookie();
+		$this->getLsUsed();
+		
+		if (isset($_COOKIE[static::LS_ERROR_COOKIE_NAME]) AND 
+		    !empty($this->_lsvCookie)) {
+			$this->removeCache(UUID);
+		}
+		
+		if (\SM\Util\Input::get('request_sc')) {
+			$this->_fileRepeatable = true;
+		}
+	}
+	
+	public function __destruct()
+	{
+		if ($this->_lsUsed) {
+			$this->setLsvCookie();
+		}
+	}
+	
+	public function registerScriptLoc($files, $type = 'js', $lsUsed = true, $prepend = false)
+	{
+		$splitFiles = preg_split('#,#', $files, -1, PREG_SPLIT_NO_EMPTY);
+		$splitFiles = array_map('trim', $splitFiles);
+		
+		foreach ($splitFiles AS $file) {
+			if ($file != '' AND strpos($file, '/') > 0) {
+				$namespace = explode('/', $file)[0];
+				
+				if ($this->_fileRepeatable == true || !isset($this->_fileRepeat[$namespace][$type][$file])) {
+					$this->getFileMap($namespace);
+					
+					if (isset($this->_fileMap[$namespace][$type][$file])) {
+						$filemap = $this->_fileMap[$namespace][$type][$file];
+						$filemap['f'] = $file . '.' . $type;
+						
+						if ($lsUsed AND 
+						    $this->_lsUsed AND 
+						    isset($this->_lsvCookie[$filemap['c']]) AND 
+						    $filemap['v'] === $this->_lsvCookie[$filemap['c']]) {
+							
+							$this->getScriptFromStorage($filemap, $type, $prepend);
+						} else {
+							$this->getScriptFromLoc($filemap, $type, $lsUsed, $prepend);
+						}
+					}
+					$this->_fileRepeat[$namespace][$type][$file] = 1;
+				}
+			}
+		}
+		return $this;
+	}
+	
+	public function openFileBottom()
+	{
+		$this->_fileBottom = true;
+	}
+	
+	public function renderAll()
+	{
+		foreach (['prepend', 'append'] AS $v) {
+			if (isset($this->_fileScript[$v])) {
+				echo implode('', $this->_fileScript[$v]);
+			}
+		}
+	}
+	
+	public function getLsv()
+	{
+		return $this->_lsv;
+	}
+	
+	private function getScriptFromStorage($filemap, $type, $prepend)
+	{
+		$id = 'ls[' . $filemap['c'] . ']';
+		$echo = ($type == 'css' || $type == 'symbol') ? true : false;
+		
+		$this->scriptOutput('', 'sm.ls2dom("' . $id . '","' . $filemap['v'] . '","' . $type . '")', 'js', $echo, $prepend);
+	}
+	
+	private function getScriptFromLoc($filemap, $type, $lsUsed, $prepend)
+	{
+		$id = 'ls[' . $filemap['c'] . ']';
+		
+		$file = SM_ROOT . '/' . $type . '/' . $filemap['f'];
+		$fileMin = $file . ((isset($_GET['jsdebug']) AND IS_WHITE_IP === true) ? '' : static::MIN_SUFFIX);
+		
+		if (is_file($fileMin)) {
+			$con = file_get_contents($fileMin);
+		} elseif (is_file($file)) {
+			$con = file_get_contents($file);
+		} else {
+			$con = '';
+		}
+		
+		$this->scriptOutput($id, $con, $type, !$lsUsed, $prepend);
+		
+		if ($lsUsed AND 
+		    $this->_lsUsed AND 
+		    mb_strlen($con, 'UTF-8') > static::MIN_FILESIZE AND 
+		    md5_file($fileMin) == $filemap['m']) {
+			
+			$this->_lsvCookie[$filemap['c']] = $filemap['v'];
+			$this->scriptOutput('', 'sm.res2ls("' . $id . '","' . $filemap['v'] . '","' . $type . '")', 'js', $type == 'symbol' ? true : false, $prepend);
+		} elseif ($type == 'symbol') {
+			$this->scriptOutput('', 'sm.res2dom("' . $id . '","' . $filemap['v'] . '","' . $type . '")', 'js', true, $prepend);
+		}
+	}
+	
+	private function scriptOutput($id = '', $con = '', $type = 'js', $echo = true, $prepend = false)
+	{
+		$id = !empty($id) ? ' id="' . $id . '"' : '';
+		
+		if ($type == 'js') {
+			$code = '<script' . $id . '>' . $con . '</script>';
+			
+			if ($this->_fileBottom AND !$echo AND !isset($_GET['ft'])) {
+				if ($prepend) {
+					$this->_fileScript['prepend'][] = $code;
+				} else {
+					$this->_fileScript['append'][] = $code;
+				}
+			} else {
+				echo $code;
+			}
+		} elseif ($type == 'symbol') {
+			echo '<script type="text/symbol" ' . $id . '>' . $con . '</script>';
+		} else {
+			echo '<style' . $id . '>' . $con . '</style>';
+		}
+	}
+	
+	private function getLsUsed()
+	{
+		$this->_lsUsed = !isset($_GET['jsdebug']) && 
+		                 !isset($_GET['ft']) && 
+		                 !isset($_COOKIE[static::LS_ERROR_COOKIE_NAME]);
+	}
+	
+	private function getFileMap($namespace)
+	{
+		if (!isset($this->_fileMap[$namespace])) {
+			$file = SM_PATH . '/Config/filemap_' . $namespace . '.php';
+			
+			if (is_file($file)) {
+				$this->_fileMap[$namespace] = require $file;
+			}
+		}
+	}
+	
+	private function getLsvCookie()
+	{
+		if (!$lsv = $this->getCache(UUID) AND isset($_COOKIE[static::LSV_COOKIE_NAME])) {
+			$lsv = $_COOKIE[static::LSV_COOKIE_NAME];
+			
+			if ($this->_useMemcached) {
+				\SM\Util\Cookie::delete(static::LSV_COOKIE_NAME);
+			}
+		}
+		
+		if ($lsv != '' AND strlen($lsv) % 4 == 0) {
+			$this->_lsv = $lsv;
+			
+			foreach (str_split($lsv, 4) AS $v) {
+				$this->_lsvCookie[substr($v, 0, 3)] = substr($v, 3, 1);
+			}
+		}
+	}
+	
+	private function setLsvCookie()
+	{
+		if (!empty($this->_lsvCookie)) {
+			ksort($this->_lsvCookie);
+			
+			$lsv = '';
+			foreach ($this->_lsvCookie AS $k => $v) {
+				$lsv .= $k . $v;
+			}
+			
+			if ($this->_useMemcached) {
+				$this->setCache(UUID, $lsv);
+			} else {
+				if (!isset($_COOKIE[static::LSV_COOKIE_NAME]) OR $_COOKIE[static::LSV_COOKIE_NAME] != $lsv) {
+					$this->scriptOutput('', 'sm.setCookie("' . static::LSV_COOKIE_NAME .  '", "' . $lsv . '", new Date(15552e6+(+new Date())))');
+				}
+			}
+		}
+	}
+	
+	private function getMemcached()
+	{
+		if ($this->_useMemcached) {
+			try {
+				static $_memcached;
+				
+				if (!$_memcached) {
+					global $conf_memcached;
+					$_memcached = \SM\Cache\Cache::getInstance('memcached', $conf_memcached, 'lsmap2');
+				}
+				return $_memcached;
+			} catch (\Exception $e) {
+				$this->_useMemcached = false;
+			}
+		}
+	}
+	
+	private function getCache($key)
+	{
+		$data = null;
+		if ($this->_useMemcached) {
+			$data = $this->getMemcached()->get($key);
+		}
+		return $data;
+	}
+	
+	private function setCache($key, $data)
+	{
+		if ($this->_useMemcached) {
+			$this->getMemcached()->set($key, $data, 86400 * 180);
+		}
+	}
+	
+	private function removeCache($key)
+	{
+		if ($this->_useMemcached) {
+			$this->getMemcached()->remove($key);
+		}
+	}
+}
